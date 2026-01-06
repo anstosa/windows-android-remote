@@ -37,38 +37,7 @@ The script will automatically check for and install missing dependencies (`adb` 
 
 ## Usage
 
-### Quick Start
-
-**Option 1: Double-click `phone-remote.vbs`** (Non-Interactive Mode)
-
-- Runs the script without showing a console window
-- Skips optional steps (desktop shortcuts, dependency installation prompts)
-- Only attempts automatic connections (remembered pairings, single mDNS services)
-- If no connection is established, automatically re-launches in interactive mode
-- Best for quick access when device is already paired
-
-**Option 2: Run PowerShell script directly** (Interactive Mode)
-
-```powershell
-.\phone-remote.ps1
-```
-
-- Shows full console output
-- Prompts for all user input (pairing codes, IP addresses, etc.)
-- Creates desktop shortcuts if missing
-- Prompts to install missing dependencies
-- Best for first-time setup or troubleshooting
-
-**Option 3: Run with Non-Interactive Flag**
-
-```powershell
-.\phone-remote.ps1 -NonInteractive
-```
-
-- Explicitly runs in non-interactive mode
-- Same behavior as Option 1 but with console window visible
-
-### First-Time Setup
+### First-Run Setup
 
 1. On your Android device:
 
@@ -78,13 +47,14 @@ The script will automatically check for and install missing dependencies (`adb` 
 
 2. Run the script:
 
-   - The script will discover your device via mDNS
+   - Double click `First Run` shortcut
+   - Follow the prompts
    - If discovery works, you'll be prompted for the pairing code
    - If discovery fails, you'll enter the IP and ports manually
 
-3. Connection is saved:
-   - The script remembers your pairing per subnet
-   - Future connections on the same network will be automatic
+### Run again
+
+The proper shortcuts are now installed and your phone is paired. You can add the shortcut from your desktop to your start menu. It will silently re-connect or if it can't find a saved connection it will restart in interactive mode
 
 ### Connection Methods
 
