@@ -139,6 +139,7 @@ You can manually edit this file if needed, or delete it to reset all saved pairi
 - Ports may have changed - try manual mode to re-enter ports
 - Ensure your firewall isn't blocking ADB connections
 - Verify Wireless Debugging is still enabled on your device
+- Press 'r' during setup to restart and try again
 
 ### Wrong Subnet Detected
 

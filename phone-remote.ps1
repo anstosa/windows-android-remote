@@ -27,6 +27,9 @@ if (-not $NonInteractive) {
 # Set script-scoped variable for use in functions
 $script:NonInteractive = $NonInteractive
 
+# Restart monitoring
+$script:RestartRequested = $false
+
 function Test-Command($name) {
   if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
     throw "Missing required command: '$name'. Install it and ensure it's in PATH."
@@ -38,11 +41,14 @@ function Install-Dependency($name, $wingetPackage) {
     throw "Missing required dependency: $name. Please install it manually and ensure it's in PATH."
   }
   
+  if (Test-RestartRequested) { Restart-Script }
+  
   Write-Host ""
   Write-Warning "Missing dependency: $name"
-  Write-Host "  " -NoNewline
-  Write-Host "> " -ForegroundColor Cyan -NoNewline
-  $response = Read-Host "Would you like to install it automatically? (Y/n)"
+  
+  $response = Read-HostWithRestart "Would you like to install it automatically? (Y/n)"
+  
+  if (Test-RestartRequested) { Restart-Script }
   
   if ($response -match '^[Nn]') {
     throw "Installation cancelled. Please install $name manually and ensure it's in PATH."
@@ -158,12 +164,92 @@ function Write-Section($message) {
   Write-Host ""
 }
 
+function Test-RestartRequested {
+  if ($script:NonInteractive) { return $false }
+  if ($script:RestartRequested) {
+    return $true
+  }
+  
+  # Check if key is available and is 'r'
+  if ([Console]::KeyAvailable) {
+    $key = [Console]::ReadKey($true)
+    if ($key.KeyChar -eq 'r' -or $key.KeyChar -eq 'R') {
+      $script:RestartRequested = $true
+      return $true
+    }
+    # Put the key back if it wasn't 'r' (we'll handle it in the input functions)
+    # Actually, we can't put it back easily, so we'll just consume it
+    # The input functions will handle their own key reading
+  }
+  
+  return $false
+}
+
+function Restart-Script {
+  Write-Host ""
+  Write-Info "Restarting script..."
+  Start-Sleep -Seconds 1
+  
+  $scriptPath = if ($PSScriptRoot) { 
+    Join-Path $PSScriptRoot "phone-remote.ps1"
+  } 
+  else { 
+    $MyInvocation.PSCommandPath
+  }
+  
+  $powershellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+  $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+  if ($script:NonInteractive) {
+    $arguments += " -NonInteractive"
+  }
+  
+  Start-Process -FilePath $powershellExe -ArgumentList $arguments
+  exit 0
+}
+
 function Read-WithDefault($prompt, $default) {
+  if (Test-RestartRequested) { Restart-Script }
+  
   Write-Host "  " -NoNewline
   Write-Host "> " -ForegroundColor Cyan -NoNewline
-  $v = Read-Host "$prompt (default: $default)"
-  if ([string]::IsNullOrWhiteSpace($v)) { return $default }
-  return $v
+  Write-Host "$prompt (default: $default)" -NoNewline
+  Write-Host " (Press 'r' then Enter to restart)" -ForegroundColor DarkGray
+  Write-Host "  " -NoNewline
+  Write-Host "> " -ForegroundColor Cyan -NoNewline
+  
+  # Use a custom input loop that checks for 'r'+Enter to restart
+  $userInput = ""
+  
+  while ($true) {
+    if (Test-RestartRequested) { Restart-Script }
+    
+    # Use blocking ReadKey - it will wait for a key press
+    $key = [Console]::ReadKey($true)
+    
+    # Check for Enter key
+    if ($key.Key -eq 'Enter' -or $key.KeyChar -eq [char]13 -or $key.KeyChar -eq [char]10) {
+      # If input is just 'r' or 'R', restart; otherwise accept input
+      if ($userInput -eq 'r' -or $userInput -eq 'R') {
+        Restart-Script
+      }
+      break
+    }
+    elseif ($key.Key -eq 'Backspace') {
+      if ($userInput.Length -gt 0) {
+        $userInput = $userInput.Substring(0, $userInput.Length - 1)
+        Write-Host "`b `b" -NoNewline
+      }
+    }
+    # Add all printable characters (including 'r')
+    elseif (-not [char]::IsControl($key.KeyChar)) {
+      $userInput += $key.KeyChar
+      Write-Host $key.KeyChar -NoNewline
+    }
+  }
+  
+  Write-Host ""
+  if ([string]::IsNullOrWhiteSpace($userInput)) { return $default }
+  return $userInput
 }
 
 function Get-MdnsServices {
@@ -195,6 +281,8 @@ function Select-Service($services, $label) {
     return $null
   }
 
+  if (Test-RestartRequested) { Restart-Script }
+
   Write-Host ""
   Write-Host "  $label services found:" -ForegroundColor Cyan
   for ($i = 0; $i -lt $services.Count; $i++) {
@@ -207,9 +295,8 @@ function Select-Service($services, $label) {
     Write-Host "(IP: $serviceIp)" -ForegroundColor DarkGray
   }
   Write-Host ""
-  Write-Host "  " -NoNewline
-  Write-Host "> " -ForegroundColor Cyan -NoNewline
-  $idx = Read-Host "Enter index to use (blank to skip to manual)"
+  
+  $idx = Read-HostWithRestart "Enter index to use (blank to skip to manual)"
   if ([string]::IsNullOrWhiteSpace($idx)) { return $null }
   if ($idx -notmatch '^\d+$') { return $null }
 
@@ -218,34 +305,86 @@ function Select-Service($services, $label) {
   return $services[$n]
 }
 
+function Read-HostWithRestart($prompt) {
+  if (Test-RestartRequested) { Restart-Script }
+  
+  Write-Host "  " -NoNewline
+  Write-Host "> " -ForegroundColor Cyan -NoNewline
+  Write-Host "$prompt" -NoNewline
+  Write-Host " (Press 'r' then Enter to restart)" -ForegroundColor DarkGray
+  Write-Host "  " -NoNewline
+  Write-Host "> " -ForegroundColor Cyan -NoNewline
+  
+  # Use a custom input loop that checks for 'r'+Enter to restart
+  $userInput = ""
+  
+  while ($true) {
+    if (Test-RestartRequested) { Restart-Script }
+    
+    # Use blocking ReadKey - it will wait for a key press
+    $key = [Console]::ReadKey($true)
+    
+    # Check for Enter key
+    if ($key.Key -eq 'Enter' -or $key.KeyChar -eq [char]13 -or $key.KeyChar -eq [char]10) {
+      # If input is just 'r' or 'R', restart; otherwise accept input
+      if ($userInput -eq 'r' -or $userInput -eq 'R') {
+        Restart-Script
+      }
+      break
+    }
+    elseif ($key.Key -eq 'Backspace') {
+      if ($userInput.Length -gt 0) {
+        $userInput = $userInput.Substring(0, $userInput.Length - 1)
+        Write-Host "`b `b" -NoNewline
+      }
+    }
+    # Add all printable characters (including 'r')
+    elseif (-not [char]::IsControl($key.KeyChar)) {
+      $userInput += $key.KeyChar
+      Write-Host $key.KeyChar -NoNewline
+    }
+  }
+  
+  Write-Host ""
+  return $userInput
+}
+
 function Connect-ManualPair {
   # Manual pairing requires user interaction, skip in non-interactive mode
   if ($script:NonInteractive) {
     return $false
   }
   
+  if (Test-RestartRequested) { Restart-Script }
+  
   Write-Host ""
   Write-Section "Manual Pairing Mode"
   Write-Info "Using phone's Wireless debugging screen values."
-  $defaultIp = "192.168.12.185"
+  $defaultIp = Get-ReasonableDefaultIp
   $ip = Read-WithDefault "Enter phone IP" $defaultIp
+
+  if (Test-RestartRequested) { Restart-Script }
 
   Write-Host ""
   Write-Info "On phone: Developer options -> Wireless debugging -> Pair device with pairing code"
-  Write-Host "  " -NoNewline
-  Write-Host "> " -ForegroundColor Cyan -NoNewline
-  $pairPort = Read-Host "Enter pairing port (shown on pairing screen)"
-  Write-Host "  " -NoNewline
-  Write-Host "> " -ForegroundColor Cyan -NoNewline
-  $code = Read-Host "Enter pairing code"
+  $pairPort = Read-HostWithRestart "Enter pairing port (shown on pairing screen)"
+  
+  if (Test-RestartRequested) { Restart-Script }
+  
+  $code = Read-HostWithRestart "Enter pairing code"
+
+  if (Test-RestartRequested) { Restart-Script }
 
   adb pair "$ip`:$pairPort" $code
 
+  if (Test-RestartRequested) { Restart-Script }
+
   Write-Host ""
   Write-Info "On phone: Developer options -> Wireless debugging (main screen)"
-  Write-Host "  " -NoNewline
-  Write-Host "> " -ForegroundColor Cyan -NoNewline
-  $connectPort = Read-Host "Enter connect port (shown on main Wireless debugging screen)"
+  $connectPort = Read-HostWithRestart "Enter connect port (shown on main Wireless debugging screen)"
+  
+  if (Test-RestartRequested) { Restart-Script }
+  
   adb connect "$ip`:$connectPort"
   return $true
 }
@@ -489,6 +628,16 @@ function Connect-RememberedPairings {
   return $false
 }
 
+function Get-ReasonableDefaultIp {
+  # Get a reasonable default IP for manual entry
+  # Tries to detect subnet and use .100, falls back to common default
+  $subnet = Get-CurrentSubnet
+  if ($subnet) {
+    return "$subnet.100"
+  }
+  return "192.168.1.100"
+}
+
 function Get-DefaultIpFromConfig {
   # Get the most recently used IP from config, or return default
   $cfg = Import-Config
@@ -508,7 +657,7 @@ function Get-DefaultIpFromConfig {
       }
     }
   }
-  return "192.168.12.185"
+  return Get-ReasonableDefaultIp
 }
 
 function Get-PairingProperty($pairing, $propertyName) {
@@ -528,6 +677,8 @@ function ConnectOrPairManual($defaultIp) {
     return $false
   }
   
+  if (Test-RestartRequested) { Restart-Script }
+  
   $cfg = Import-Config
 
   # Use default IP from config if not provided
@@ -539,6 +690,9 @@ function ConnectOrPairManual($defaultIp) {
 
   # Ask for IP/ports (with sane defaults)
   $ip = Read-WithDefault "Enter phone IP" $defaultIp
+  
+  if (Test-RestartRequested) { Restart-Script }
+  
   Write-Success "Using device IP: $ip"
   $subnet = Get-SubnetFromIp $ip
 
@@ -560,6 +714,8 @@ function ConnectOrPairManual($defaultIp) {
     Write-Warning "Remembered endpoint didn't connect. Falling back..."
   }
 
+  if (Test-RestartRequested) { Restart-Script }
+
   # Try connect-only first using last known connect port for this subnet if present
   $rememberedConnectPort = Get-PairingProperty $subnetPairing "connectPort"
   $connectPortDefault = if ($rememberedConnectPort) { 
@@ -571,6 +727,9 @@ function ConnectOrPairManual($defaultIp) {
   Write-Host ""
   Write-Info "On phone: Developer options -> Wireless debugging (main screen)"
   $connectPort = Read-WithDefault "Enter connect port (Wireless debugging main screen)" $connectPortDefault
+  
+  if (Test-RestartRequested) { Restart-Script }
+  
   $endpoint = "$ip`:$connectPort"
 
   Write-Info "Trying connect-only: $endpoint"
@@ -590,10 +749,9 @@ function ConnectOrPairManual($defaultIp) {
     return $true
   }
 
-  Write-Host ""
-  Write-Host "  " -NoNewline
-  Write-Host "> " -ForegroundColor Cyan -NoNewline
-  $connectPort2 = Read-Host "Connect failed. Enter a different connect port to retry (or press Enter to proceed to pairing)"
+  if (Test-RestartRequested) { Restart-Script }
+
+  $connectPort2 = Read-HostWithRestart "Connect failed. Enter a different connect port to retry (or press Enter to proceed to pairing)"
   if (-not [string]::IsNullOrWhiteSpace($connectPort2)) {
     $endpoint2 = "$ip`:$connectPort2"
     Write-Info "Trying alternative port: $endpoint2"
@@ -614,6 +772,7 @@ function ConnectOrPairManual($defaultIp) {
     }
   }
 
+  if (Test-RestartRequested) { Restart-Script }
 
   # If connect failed, THEN pair
   Write-Host ""
@@ -631,15 +790,19 @@ function ConnectOrPairManual($defaultIp) {
     Read-WithDefault "Enter pairing port (Pair device with pairing code screen)" $pairPortDefault
   }
   else {
-    Write-Host "  " -NoNewline
-    Write-Host "> " -ForegroundColor Cyan -NoNewline
-    Read-Host "Enter pairing port (Pair device with pairing code screen)"
+    Read-HostWithRestart "Enter pairing port (Pair device with pairing code screen)"
   }
-  Write-Host "  " -NoNewline
-  Write-Host "> " -ForegroundColor Cyan -NoNewline
-  $code = Read-Host "Enter pairing code"
+  
+  if (Test-RestartRequested) { Restart-Script }
+  
+  $code = Read-HostWithRestart "Enter pairing code"
+  
+  if (Test-RestartRequested) { Restart-Script }
+  
   Write-Info "Pairing with device..."
   & adb pair "$ip`:$pairPort" $code | Out-Null
+
+  if (Test-RestartRequested) { Restart-Script }
 
   # Try connect again after pairing
   Write-Info "Connecting after pairing..."
@@ -668,6 +831,8 @@ function Test-DesktopShortcuts {
   if ($script:NonInteractive) {
     return
   }
+  
+  if (Test-RestartRequested) { Restart-Script }
   
   # Get desktop path
   $desktopPath = [Environment]::GetFolderPath("Desktop")
@@ -736,9 +901,10 @@ function Test-DesktopShortcuts {
       Write-Host "  - Phone Remote (Interactive)" -ForegroundColor Yellow
     }
     Write-Host ""
-    Write-Host "  " -NoNewline
-    Write-Host "> " -ForegroundColor Cyan -NoNewline
-    $response = Read-Host "Would you like to create them? (Y/n)"
+    
+    $response = Read-HostWithRestart "Would you like to create them? (Y/n)"
+
+    if (Test-RestartRequested) { Restart-Script }
 
     if ($response -match '^[Nn]') {
       Write-Info "Skipping shortcut creation."
@@ -752,7 +918,8 @@ function Test-DesktopShortcuts {
   if (-not $shortcut1Exists) {
     try {
       $shortcut = $shell.CreateShortcut($shortcut1Path)
-      $shortcut.TargetPath = $vbsPath
+      $shortcut.TargetPath = $powershellExe
+      $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$ps1Path`" -NonInteractive"
       $shortcut.WorkingDirectory = $scriptDir
       $shortcut.Description = "Phone Remote - Wireless Android Control"
       if ($iconPath) {
@@ -766,15 +933,21 @@ function Test-DesktopShortcuts {
     }
   }
   elseif ($iconPath) {
-    # Update existing shortcut with icon
+    # Update existing shortcut with icon and ensure it points to PowerShell (for taskbar pinning)
     try {
       $shortcut = $shell.CreateShortcut($shortcut1Path)
+      # Update to PowerShell if it's still pointing to VBScript (for taskbar pinning compatibility)
+      if ($shortcut.TargetPath -like "*.vbs" -or $shortcut.TargetPath -like "*wscript.exe*") {
+        $shortcut.TargetPath = $powershellExe
+        $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$ps1Path`" -NonInteractive"
+        $shortcut.WorkingDirectory = $scriptDir
+      }
       $shortcut.IconLocation = $iconPath
       $shortcut.Save()
-      Write-Success "Updated icon for shortcut: Phone Remote"
+      Write-Success "Updated shortcut: Phone Remote"
     }
     catch {
-      Write-Warning "Failed to update 'Phone Remote' shortcut icon: $_"
+      Write-Warning "Failed to update 'Phone Remote' shortcut: $_"
     }
   }
 
@@ -814,20 +987,31 @@ function Test-DesktopShortcuts {
 # Check and install missing dependencies
 Test-AndInstall-Dependencies
 
+if (Test-RestartRequested) { Restart-Script }
+
 # Final verification that dependencies are available
 Test-Command adb
 Test-Command scrcpy
 
+if (Test-RestartRequested) { Restart-Script }
+
 # Check and optionally create desktop shortcuts
 Test-DesktopShortcuts
 
+if (Test-RestartRequested) { Restart-Script }
+
 adb start-server | Out-Null
+
+if (Test-RestartRequested) { Restart-Script }
 
 Show-Banner
 
 Write-Section "Discovering Devices"
 Write-Info "Discovering Wireless Debugging services via mDNS..."
+Write-Info "(Press 'r' at any time to restart)" -ForegroundColor DarkGray
 $all = Get-MdnsServices
+
+if (Test-RestartRequested) { Restart-Script }
 
 # Filter to pairing/connect services
 $pairing = @($all | Where-Object { $_ -match "_adb-tls-pairing" })
@@ -854,21 +1038,29 @@ if ($useMdns) {
       $useMdns = $false
     }
     else {
+      if (Test-RestartRequested) { Restart-Script }
+      
       Write-Section "Pairing Device"
       # Extract and print IP from pairing service
       $pairIp = if ($pairService -match '^(.+?):') { $matches[1] } else { "N/A" }
       Write-Success "Pairing with device IP: $pairIp"
       Write-Host ""
       Write-Info "On phone: Developer options -> Wireless debugging -> Pair device with pairing code"
-      Write-Host "  " -NoNewline
-      Write-Host "> " -ForegroundColor Cyan -NoNewline
-      $code = Read-Host "Enter pairing code from phone"
+      $code = Read-HostWithRestart "Enter pairing code from phone"
+      
+      if (Test-RestartRequested) { Restart-Script }
+      
       Write-Info "Pairing with device..."
       adb pair $pairService $code
+
+      if (Test-RestartRequested) { Restart-Script }
 
       Write-Section "Connecting Device"
       # Refresh connect list after pairing
       $all2 = Get-MdnsServices
+      
+      if (Test-RestartRequested) { Restart-Script }
+      
       $connect2 = @($all2 | Where-Object { $_ -match "_adb-tls-connect" })
       if ($connect2.Count -eq 0) {
         $useMdns = $false
@@ -877,6 +1069,8 @@ if ($useMdns) {
         $connService = Select-Service $connect2 "Connect (_adb-tls-connect)"
         if (-not $connService) { $useMdns = $false }
         else {
+          if (Test-RestartRequested) { Restart-Script }
+          
           # Extract and print IP from connect service
           $connIp = if ($connService -match '^(.+?):') { $matches[1] } else { "N/A" }
           Write-Success "Connecting to device IP: $connIp"
@@ -888,18 +1082,23 @@ if ($useMdns) {
 }
 
 if (-not $useMdns) {
+  if (Test-RestartRequested) { Restart-Script }
+  
   Write-Warning "mDNS discovery didn't look usable."
   Write-Host ""
   
   # Try remembered pairings first
   if (Connect-RememberedPairings) {
+    if (Test-RestartRequested) { Restart-Script }
     Write-Success "Successfully connected using remembered pairing."
   }
   else {
+    if (Test-RestartRequested) { Restart-Script }
     Write-Warning "No remembered pairings worked. Falling back to manual mode."
     $defaultIp = Get-DefaultIpFromConfig
     $ok = ConnectOrPairManual $defaultIp
     if (-not $ok) {
+      if (Test-RestartRequested) { Restart-Script }
       Write-Host ""
       if ($script:NonInteractive) {
         Write-Warning "Could not connect/pair in non-interactive mode."
@@ -913,6 +1112,8 @@ if (-not $useMdns) {
     }
   }
 }
+
+if (Test-RestartRequested) { Restart-Script }
 
 # Check if a device is connected
 $deviceConnected = Test-DeviceConnected
