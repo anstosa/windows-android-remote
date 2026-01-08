@@ -27,6 +27,17 @@ if (-not $NonInteractive) {
 # Set script-scoped variable for use in functions
 $script:NonInteractive = $NonInteractive
 
+# Track if we originally started in non-interactive mode (before any fallback)
+# Check environment variable first (set when falling back to interactive)
+if ($env:PHONE_REMOTE_RESTART_NONINTERACTIVE -eq "1") {
+  $script:OriginallyNonInteractive = $true
+  # Clear the env var so it doesn't persist
+  Remove-Item Env:\PHONE_REMOTE_RESTART_NONINTERACTIVE
+}
+else {
+  $script:OriginallyNonInteractive = $NonInteractive
+}
+
 # Restart monitoring
 $script:RestartRequested = $false
 
@@ -360,7 +371,7 @@ function Connect-ManualPair {
   Write-Host ""
   Write-Section "Manual Pairing Mode"
   Write-Info "Using phone's Wireless debugging screen values."
-  $defaultIp = Get-ReasonableDefaultIp
+  $defaultIp = Get-DefaultIpFromConfig
   $ip = Read-WithDefault "Enter phone IP" $defaultIp
 
   if (Test-RestartRequested) { Restart-Script }
@@ -555,6 +566,11 @@ function Test-DeviceConnected {
 
 function Start-InteractiveMode {
   # Re-launch the script in interactive mode
+  # If we originally started non-interactive, set env var to restart non-interactive after connection
+  if ($script:OriginallyNonInteractive) {
+    $env:PHONE_REMOTE_RESTART_NONINTERACTIVE = "1"
+  }
+  
   $scriptPath = if ($PSScriptRoot) { 
     Join-Path $PSScriptRoot "phone-remote.ps1"
   } 
@@ -1006,82 +1022,130 @@ if (Test-RestartRequested) { Restart-Script }
 
 Show-Banner
 
-Write-Section "Discovering Devices"
-Write-Info "Discovering Wireless Debugging services via mDNS..."
-Write-Info "(Press 'r' at any time to restart)" -ForegroundColor DarkGray
-$all = Get-MdnsServices
+# Check if device is already connected before attempting mDNS discovery
+$deviceAlreadyConnected = Test-DeviceConnected
+if ($deviceAlreadyConnected) {
+  Write-Section "Device Already Connected"
+  Write-Success "Found an already connected ADB device. Skipping mDNS discovery."
+  Write-Host ""
+  $useMdns = $false  # Skip mDNS since device is already connected
+}
+else {
+  Write-Section "Discovering Devices"
+  Write-Info "Discovering Wireless Debugging services via mDNS..."
+  Write-Info "(Press 'r' at any time to restart)" -ForegroundColor DarkGray
+  $all = Get-MdnsServices
 
-if (Test-RestartRequested) { Restart-Script }
+  if (Test-RestartRequested) { Restart-Script }
 
-# Filter to pairing/connect services
-$pairing = @($all | Where-Object { $_ -match "_adb-tls-pairing" })
-$connect = @($all | Where-Object { $_ -match "_adb-tls-connect" })
+  # Filter to pairing/connect services
+  $pairing = @($all | Where-Object { $_ -match "_adb-tls-pairing" })
+  $connect = @($all | Where-Object { $_ -match "_adb-tls-connect" })
 
-$useMdns = $true
+  $useMdns = $true
 
-# "Doesn't look good" criteria:
-# - No services at all
-# - Missing either pairing or connect group
-# - Too many services on both sides (likely stale/other devices) and user doesn't pick one
-if ($all.Count -eq 0) { $useMdns = $false }
-if ($pairing.Count -eq 0 -or $connect.Count -eq 0) { $useMdns = $false }
-
-if ($useMdns) {
-  # Let user choose if multiple; blank selection triggers manual fallback
-  $pairService = Select-Service $pairing "Pairing (_adb-tls-pairing)"
-  if (-not $pairService) { $useMdns = $false }
-
-  if ($useMdns) {
-    # Skip pairing in non-interactive mode (requires user input)
-    if ($script:NonInteractive) {
-      Write-Warning "Pairing required but skipped in non-interactive mode."
-      $useMdns = $false
+  # "Doesn't look good" criteria:
+  # - No services at all
+  if ($all.Count -eq 0) { 
+    $useMdns = $false 
+  }
+  # If we have connect services but no pairing services, device is already paired - try connecting directly
+  elseif ($connect.Count -gt 0 -and $pairing.Count -eq 0) {
+    # Device is already paired, try connecting directly
+    Write-Info "Found connect service(s) but no pairing service(s) - device appears to be already paired."
+    
+    if (Test-RestartRequested) { Restart-Script }
+    
+    $connService = Select-Service $connect "Connect (_adb-tls-connect)"
+    if ($connService) {
+      if (Test-RestartRequested) { Restart-Script }
+      
+      Write-Section "Connecting Device"
+      # Extract and print IP from connect service
+      $connIp = if ($connService -match '^(.+?):') { $matches[1] } else { "N/A" }
+      Write-Success "Connecting to device IP: $connIp"
+      if (Test-AdbConnect $connService) {
+        Write-Success "Connected successfully via mDNS!"
+        $useMdns = $true  # Mark as successful so we don't fall back
+      }
+      else {
+        Write-Warning "Failed to connect via mDNS connect service."
+        $useMdns = $false
+      }
     }
     else {
-      if (Test-RestartRequested) { Restart-Script }
-      
-      Write-Section "Pairing Device"
-      # Extract and print IP from pairing service
-      $pairIp = if ($pairService -match '^(.+?):') { $matches[1] } else { "N/A" }
-      Write-Success "Pairing with device IP: $pairIp"
-      Write-Host ""
-      Write-Info "On phone: Developer options -> Wireless debugging -> Pair device with pairing code"
-      $code = Read-HostWithRestart "Enter pairing code from phone"
-      
-      if (Test-RestartRequested) { Restart-Script }
-      
-      Write-Info "Pairing with device..."
-      adb pair $pairService $code
-
-      if (Test-RestartRequested) { Restart-Script }
-
-      Write-Section "Connecting Device"
-      # Refresh connect list after pairing
-      $all2 = Get-MdnsServices
-      
-      if (Test-RestartRequested) { Restart-Script }
-      
-      $connect2 = @($all2 | Where-Object { $_ -match "_adb-tls-connect" })
-      if ($connect2.Count -eq 0) {
+      $useMdns = $false
+    }
+  }
+  # If we have pairing services but no connect services, something is wrong
+  elseif ($pairing.Count -gt 0 -and $connect.Count -eq 0) {
+    Write-Warning "Found pairing service(s) but no connect service(s). This is unusual - device may need to be reset."
+    $useMdns = $false
+  }
+  # If we have both, proceed with normal pairing flow
+  elseif ($pairing.Count -gt 0 -and $connect.Count -gt 0) {
+    # Let user choose if multiple; blank selection triggers manual fallback
+    $pairService = Select-Service $pairing "Pairing (_adb-tls-pairing)"
+    if (-not $pairService) { 
+      $useMdns = $false 
+    }
+    else {
+      # Skip pairing in non-interactive mode (requires user input)
+      if ($script:NonInteractive) {
+        Write-Warning "Pairing required but skipped in non-interactive mode."
         $useMdns = $false
       }
       else {
-        $connService = Select-Service $connect2 "Connect (_adb-tls-connect)"
-        if (-not $connService) { $useMdns = $false }
+        if (Test-RestartRequested) { Restart-Script }
+        
+        Write-Section "Pairing Device"
+        # Extract and print IP from pairing service
+        $pairIp = if ($pairService -match '^(.+?):') { $matches[1] } else { "N/A" }
+        Write-Success "Pairing with device IP: $pairIp"
+        Write-Host ""
+        Write-Info "On phone: Developer options -> Wireless debugging -> Pair device with pairing code"
+        $code = Read-HostWithRestart "Enter pairing code from phone"
+        
+        if (Test-RestartRequested) { Restart-Script }
+        
+        Write-Info "Pairing with device..."
+        adb pair $pairService $code
+
+        if (Test-RestartRequested) { Restart-Script }
+
+        Write-Section "Connecting Device"
+        # Refresh connect list after pairing
+        $all2 = Get-MdnsServices
+        
+        if (Test-RestartRequested) { Restart-Script }
+        
+        $connect2 = @($all2 | Where-Object { $_ -match "_adb-tls-connect" })
+        if ($connect2.Count -eq 0) {
+          $useMdns = $false
+        }
         else {
-          if (Test-RestartRequested) { Restart-Script }
-          
-          # Extract and print IP from connect service
-          $connIp = if ($connService -match '^(.+?):') { $matches[1] } else { "N/A" }
-          Write-Success "Connecting to device IP: $connIp"
-          adb connect $connService
+          $connService = Select-Service $connect2 "Connect (_adb-tls-connect)"
+          if (-not $connService) { $useMdns = $false }
+          else {
+            if (Test-RestartRequested) { Restart-Script }
+            
+            # Extract and print IP from connect service
+            $connIp = if ($connService -match '^(.+?):') { $matches[1] } else { "N/A" }
+            Write-Success "Connecting to device IP: $connIp"
+            adb connect $connService
+          }
         }
       }
     }
   }
+  else {
+    # No services found
+    $useMdns = $false
+  }
 }
 
-if (-not $useMdns) {
+# Only show mDNS warning and try fallback if device is not already connected
+if (-not $useMdns -and -not $deviceAlreadyConnected) {
   if (Test-RestartRequested) { Restart-Script }
   
   Write-Warning "mDNS discovery didn't look usable."
@@ -1155,6 +1219,26 @@ Write-Section "Connection Successful"
 Write-Success "Connected device: $serial"
 Write-Success "Device IP: $ip"
 Write-Host ""
+
+# If we originally started non-interactive and fell back to interactive, restart in non-interactive mode
+if ($script:OriginallyNonInteractive -and -not $script:NonInteractive) {
+  Write-Info "Connection established. Restarting in non-interactive mode..."
+  Start-Sleep -Seconds 1
+  
+  $scriptPath = if ($PSScriptRoot) { 
+    Join-Path $PSScriptRoot "phone-remote.ps1"
+  } 
+  else { 
+    $MyInvocation.PSCommandPath
+  }
+  
+  $powershellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+  $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -NonInteractive"
+  
+  Start-Process -FilePath $powershellExe -ArgumentList $arguments
+  exit 0
+}
+
 Write-Section "Starting Remote Session"
 Write-Info "Starting scrcpy..."
 Write-Host ""
@@ -1167,3 +1251,4 @@ catch {
   Write-Warning "UHID keyboard failed; falling back to regular scrcpy control..."
   & scrcpy --serial $serial --no-playback
 }
+
