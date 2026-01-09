@@ -263,14 +263,130 @@ function Read-WithDefault($prompt, $default) {
   return $userInput
 }
 
-function Get-MdnsServices {
-  # Returns array of service strings, may be empty.
+function Show-NetworkDiagnostics {
+  # Show network information to help debug mDNS issues
+  Write-Host ""
+  Write-Info "=== Network Diagnostics ===" -ForegroundColor Cyan
   try {
-    $raw = adb mdns services 2>$null
-    if (-not $raw) { return @() }
-    return @($raw | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ })
+    # Get local IP addresses
+    $localIps = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | 
+    Where-Object { 
+      $_.IPAddress -notlike "127.*" -and 
+      $_.IPAddress -notlike "169.254.*"
+    } | 
+    Select-Object -First 5
+    
+    if ($localIps) {
+      Write-Info "Local IP addresses:"
+      foreach ($ip in $localIps) {
+        $adapter = Get-NetAdapter -InterfaceIndex $ip.InterfaceIndex -ErrorAction SilentlyContinue
+        $adapterName = if ($adapter) { $adapter.Name } else { "Unknown" }
+        Write-Host "  - $($ip.IPAddress) ($adapterName)" -ForegroundColor Gray
+      }
+    }
+    
+    # Check if mDNS/Bonjour service is running
+    $mdnsService = Get-Service -Name "Bonjour Service" -ErrorAction SilentlyContinue
+    if ($mdnsService) {
+      if ($mdnsService.Status -eq "Running") {
+        Write-Success "Bonjour Service (mDNS) is running"
+      }
+      else {
+        Write-Warning "Bonjour Service (mDNS) is not running (Status: $($mdnsService.Status))"
+        Write-Info "  Try: Start-Service 'Bonjour Service'" -ForegroundColor DarkGray
+      }
+    }
+    else {
+      Write-Warning "Bonjour Service not found - mDNS may not be available"
+      Write-Info "  Windows 10/11 may use different mDNS implementation" -ForegroundColor DarkGray
+    }
+    
+    # Check firewall rules for mDNS
+    $mdnsFirewall = Get-NetFirewallRule -DisplayName "*mDNS*" -ErrorAction SilentlyContinue
+    if (-not $mdnsFirewall) {
+      $mdnsFirewall = Get-NetFirewallRule -DisplayName "*Bonjour*" -ErrorAction SilentlyContinue
+    }
+    if ($mdnsFirewall) {
+      Write-Info "mDNS/Bonjour firewall rules found: $($mdnsFirewall.Count)"
+    }
+    else {
+      Write-Info "No specific mDNS firewall rules found (may use default rules)"
+    }
+    
   }
   catch {
+    Write-Warning "Could not gather all network diagnostics: $_"
+  }
+  Write-Host ""
+}
+
+function Get-MdnsServices {
+  # Returns array of service strings, may be empty.
+  # Also returns diagnostic info via reference parameter
+  param([ref]$diagnostics = $null)
+  
+  try {
+    # Use temporary files to capture stdout and stderr
+    $tempDir = [System.IO.Path]::GetTempPath()
+    $stdoutFile = Join-Path $tempDir "phone_remote_stdout_$([System.Guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+    $stderrFile = Join-Path $tempDir "phone_remote_stderr_$([System.Guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+    
+    $stdout = @()
+    $stderr = @()
+    $exitCode = 0
+    
+    try {
+      $process = Start-Process -FilePath "adb" -ArgumentList "mdns", "services" -NoNewWindow -PassThru -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -Wait
+      $exitCode = $process.ExitCode
+      
+      if (Test-Path $stdoutFile) {
+        $stdout = Get-Content $stdoutFile -ErrorAction SilentlyContinue
+        Remove-Item $stdoutFile -ErrorAction SilentlyContinue
+      }
+      if (Test-Path $stderrFile) {
+        $stderr = Get-Content $stderrFile -ErrorAction SilentlyContinue
+        Remove-Item $stderrFile -ErrorAction SilentlyContinue
+      }
+    }
+    finally {
+      # Cleanup temp files if they still exist
+      if (Test-Path $stdoutFile) { Remove-Item $stdoutFile -ErrorAction SilentlyContinue }
+      if (Test-Path $stderrFile) { Remove-Item $stderrFile -ErrorAction SilentlyContinue }
+    }
+    
+    # Store diagnostics if requested
+    if ($null -ne $diagnostics) {
+      $diagnostics.Value = @{
+        ExitCode  = $exitCode
+        Stdout    = $stdout
+        Stderr    = $stderr
+        RawOutput = $stdout
+      }
+    }
+    
+    if (-not $stdout) { return @() }
+    
+    # Filter out ADB header line and empty lines
+    # ADB outputs "List of discovered mdns services" as a header, followed by actual services
+    $services = @($stdout | ForEach-Object { 
+        $line = $_.ToString().Trim()
+        # Skip header line and empty lines
+        if ($line -and $line -ne "List of discovered mdns services") {
+          $line
+        }
+      } | Where-Object { $_ })
+    
+    return $services
+  }
+  catch {
+    if ($null -ne $diagnostics) {
+      $diagnostics.Value = @{
+        Error    = $_.Exception.Message
+        ExitCode = -1
+        Stdout   = @()
+        Stderr   = @()
+      }
+    }
     return @()
   }
 }
@@ -1034,20 +1150,145 @@ else {
   Write-Section "Discovering Devices"
   Write-Info "Discovering Wireless Debugging services via mDNS..."
   Write-Info "(Press 'r' at any time to restart)" -ForegroundColor DarkGray
-  $all = Get-MdnsServices
+  Write-Host ""
+  
+  # Show what command we're running
+  Write-Info "Running: adb mdns services"
+  
+  # Try mDNS discovery multiple times (mDNS can take several seconds)
+  $script:mdnsDiagnostics = $null
+  $all = @()
+  $maxRetries = 3
+  $retryDelay = 2000  # 2 seconds between retries
+  
+  for ($retry = 1; $retry -le $maxRetries; $retry++) {
+    if ($retry -gt 1) {
+      Write-Info "Retry $retry of $maxRetries - waiting ${retryDelay}ms for mDNS discovery..." -ForegroundColor DarkGray
+      Start-Sleep -Milliseconds $retryDelay
+    }
+    else {
+      Write-Info "Waiting a moment for mDNS discovery..." -ForegroundColor DarkGray
+      Start-Sleep -Milliseconds 1500
+    }
+    
+    $all = Get-MdnsServices -diagnostics ([ref]$script:mdnsDiagnostics)
+    
+    # If we found services, break early
+    if ($all.Count -gt 0) {
+      Write-Success "Found $($all.Count) service(s) on attempt $retry"
+      break
+    }
+    
+    if ($retry -lt $maxRetries) {
+      Write-Info "No services found yet, will retry..." -ForegroundColor DarkGray
+    }
+  }
+
+  if (Test-RestartRequested) { Restart-Script }
+
+  # Show detailed diagnostics
+  Write-Host ""
+  Write-Info "=== mDNS Discovery Results ===" -ForegroundColor Cyan
+  if ($script:mdnsDiagnostics) {
+    Write-Info "Exit Code: $($script:mdnsDiagnostics.ExitCode)"
+    
+    if ($script:mdnsDiagnostics.Stderr -and $script:mdnsDiagnostics.Stderr.Count -gt 0) {
+      Write-Warning "Stderr output:"
+      foreach ($line in $script:mdnsDiagnostics.Stderr) {
+        Write-Host "  [STDERR] $line" -ForegroundColor Red
+      }
+    }
+    
+    if ($script:mdnsDiagnostics.Stdout -and $script:mdnsDiagnostics.Stdout.Count -gt 0) {
+      Write-Info "Raw stdout output ($($script:mdnsDiagnostics.Stdout.Count) lines):"
+      foreach ($line in $script:mdnsDiagnostics.Stdout) {
+        Write-Host "  [STDOUT] $line" -ForegroundColor Gray
+      }
+    }
+    else {
+      Write-Info "No stdout output received"
+    }
+  }
+  else {
+    Write-Warning "No diagnostics available"
+  }
+  
+  Write-Host ""
+  Write-Info "Processed services count: $($all.Count)"
+  if ($all.Count -gt 0) {
+    Write-Info "All discovered services:"
+    foreach ($svc in $all) {
+      Write-Host "  - $svc" -ForegroundColor Gray
+    }
+  }
 
   if (Test-RestartRequested) { Restart-Script }
 
   # Filter to pairing/connect services
+  Write-Host ""
+  Write-Info "Filtering services for ADB patterns..."
   $pairing = @($all | Where-Object { $_ -match "_adb-tls-pairing" })
   $connect = @($all | Where-Object { $_ -match "_adb-tls-connect" })
+  
+  Write-Info "Pairing services found: $($pairing.Count)"
+  if ($pairing.Count -gt 0) {
+    foreach ($svc in $pairing) {
+      Write-Host "  [PAIRING] $svc" -ForegroundColor Yellow
+    }
+  }
+  
+  Write-Info "Connect services found: $($connect.Count)"
+  if ($connect.Count -gt 0) {
+    foreach ($svc in $connect) {
+      Write-Host "  [CONNECT] $svc" -ForegroundColor Green
+    }
+  }
+  
+  Write-Host ""
 
   $useMdns = $true
 
   # "Doesn't look good" criteria:
   # - No services at all
-  if ($all.Count -eq 0) { 
-    $useMdns = $false 
+  if ($all.Count -eq 0) {
+    $useMdns = $false
+    
+    Write-Warning "=== mDNS Discovery Failed ==="
+    Write-Info "No services were discovered."
+    
+    # Provide diagnostic information
+    if ($script:mdnsDiagnostics) {
+      if ($script:mdnsDiagnostics.ExitCode -ne 0) {
+        Write-Warning "Command failed with exit code: $($script:mdnsDiagnostics.ExitCode)"
+        if ($script:mdnsDiagnostics.Stderr -and $script:mdnsDiagnostics.Stderr.Count -gt 0) {
+          Write-Info "Error details:"
+          foreach ($err in $script:mdnsDiagnostics.Stderr) {
+            Write-Host "  $err" -ForegroundColor Red
+          }
+        }
+      }
+      elseif ($script:mdnsDiagnostics.Stdout -and $script:mdnsDiagnostics.Stdout.Count -gt 0) {
+        Write-Info "Command succeeded but no services matched expected patterns."
+        Write-Info "Expected patterns: '_adb-tls-pairing' or '_adb-tls-connect'"
+      }
+      else {
+        Write-Info "Command succeeded but returned no output."
+      }
+    }
+    
+    Write-Host ""
+    Write-Info "Troubleshooting steps:"
+    Write-Host "  1. On your phone: Settings → Developer Options → Wireless Debugging" -ForegroundColor DarkGray
+    Write-Host "     - Ensure 'Wireless Debugging' toggle is ON" -ForegroundColor DarkGray
+    Write-Host "     - Check that IP address and port are shown" -ForegroundColor DarkGray
+    Write-Host "  2. Verify phone and computer are on the same Wi-Fi network" -ForegroundColor DarkGray
+    Write-Host "  3. Check Windows Firewall allows mDNS (port 5353/UDP)" -ForegroundColor DarkGray
+    Write-Host "  4. Try toggling Wireless Debugging OFF and ON again on your phone" -ForegroundColor DarkGray
+    
+    # Show network diagnostics to help debug
+    Show-NetworkDiagnostics
+    
+    Write-Info "Note: If mDNS continues to fail, you can use manual connection mode below."
   }
   # If we have connect services but no pairing services, device is already paired - try connecting directly
   elseif ($connect.Count -gt 0 -and $pairing.Count -eq 0) {
@@ -1064,29 +1305,47 @@ else {
       # Extract and print IP from connect service
       $connIp = if ($connService -match '^(.+?):') { $matches[1] } else { "N/A" }
       Write-Success "Connecting to device IP: $connIp"
-      if (Test-AdbConnect $connService) {
+      Write-Info "Attempting to connect to: $connService"
+      $connectResult = Test-AdbConnect $connService
+      if ($connectResult) {
         Write-Success "Connected successfully via mDNS!"
         $useMdns = $true  # Mark as successful so we don't fall back
       }
       else {
-        Write-Warning "Failed to connect via mDNS connect service."
+        Write-Warning "=== mDNS Connection Failed ==="
+        Write-Warning "Failed to connect via mDNS connect service: $connService"
+        Write-Info "The connect service was discovered but connection attempt failed."
+        Write-Info "Possible reasons:"
+        Write-Host "  - Port may have changed on the device" -ForegroundColor DarkGray
+        Write-Host "  - Firewall is blocking the connection" -ForegroundColor DarkGray
+        Write-Host "  - Device may need to be re-paired" -ForegroundColor DarkGray
         $useMdns = $false
       }
     }
     else {
+      Write-Warning "=== mDNS Discovery Cancelled ==="
+      Write-Info "User cancelled connect service selection."
       $useMdns = $false
     }
   }
   # If we have pairing services but no connect services, something is wrong
   elseif ($pairing.Count -gt 0 -and $connect.Count -eq 0) {
-    Write-Warning "Found pairing service(s) but no connect service(s). This is unusual - device may need to be reset."
+    Write-Warning "=== mDNS Discovery Issue ==="
+    Write-Warning "Found pairing service(s) but no connect service(s). This is unusual."
+    Write-Info "This typically means:"
+    Write-Host "  - Device may need to be reset or Wireless Debugging toggled off/on" -ForegroundColor DarkGray
+    Write-Host "  - Device may be in an inconsistent state" -ForegroundColor DarkGray
+    Write-Host "  - Connect service may appear after pairing completes" -ForegroundColor DarkGray
     $useMdns = $false
   }
   # If we have both, proceed with normal pairing flow
   elseif ($pairing.Count -gt 0 -and $connect.Count -gt 0) {
+    Write-Info "Both pairing and connect services found - proceeding with pairing flow."
     # Let user choose if multiple; blank selection triggers manual fallback
     $pairService = Select-Service $pairing "Pairing (_adb-tls-pairing)"
-    if (-not $pairService) { 
+    if (-not $pairService) {
+      Write-Warning "=== mDNS Discovery Cancelled ==="
+      Write-Info "User cancelled service selection or no service was selected."
       $useMdns = $false 
     }
     else {
@@ -1114,25 +1373,61 @@ else {
         if (Test-RestartRequested) { Restart-Script }
 
         Write-Section "Connecting Device"
+        Write-Info "Refreshing mDNS services after pairing..."
+        
         # Refresh connect list after pairing
-        $all2 = Get-MdnsServices
+        $mdnsDiagnostics2 = $null
+        $all2 = Get-MdnsServices -diagnostics ([ref]$mdnsDiagnostics2)
+        
+        Write-Info "Second mDNS discovery results:"
+        Write-Info "  Services found: $($all2.Count)"
+        if ($mdnsDiagnostics2) {
+          Write-Info "  Exit code: $($mdnsDiagnostics2.ExitCode)"
+          if ($mdnsDiagnostics2.Stderr -and $mdnsDiagnostics2.Stderr.Count -gt 0) {
+            Write-Warning "  Stderr: $($mdnsDiagnostics2.Stderr -join '; ')"
+          }
+        }
+        if ($all2.Count -gt 0) {
+          Write-Info "  All services:"
+          foreach ($svc in $all2) {
+            Write-Host "    - $svc" -ForegroundColor Gray
+          }
+        }
         
         if (Test-RestartRequested) { Restart-Script }
         
         $connect2 = @($all2 | Where-Object { $_ -match "_adb-tls-connect" })
+        Write-Info "  Connect services found: $($connect2.Count)"
         if ($connect2.Count -eq 0) {
+          Write-Warning "=== mDNS Discovery Failed After Pairing ==="
+          Write-Warning "No connect services found after pairing completed."
+          Write-Info "This may indicate:"
+          Write-Host "  - Pairing succeeded but connect service hasn't appeared yet" -ForegroundColor DarkGray
+          Write-Host "  - Device needs a moment to register the connect service" -ForegroundColor DarkGray
+          Write-Host "  - Try manual connection mode with the IP and port from Wireless Debugging screen" -ForegroundColor DarkGray
           $useMdns = $false
         }
         else {
           $connService = Select-Service $connect2 "Connect (_adb-tls-connect)"
-          if (-not $connService) { $useMdns = $false }
+          if (-not $connService) {
+            Write-Warning "=== mDNS Discovery Cancelled ==="
+            Write-Info "User cancelled connect service selection."
+            $useMdns = $false
+          }
           else {
             if (Test-RestartRequested) { Restart-Script }
             
             # Extract and print IP from connect service
             $connIp = if ($connService -match '^(.+?):') { $matches[1] } else { "N/A" }
-            Write-Success "Connecting to device IP: $connIp"
-            adb connect $connService
+            Write-Info "Attempting to connect to: $connService (IP: $connIp)"
+            $connectResult = Test-AdbConnect $connService
+            if ($connectResult) {
+              Write-Success "Connected successfully via mDNS!"
+            }
+            else {
+              Write-Warning "Connection attempt failed for: $connService"
+              Write-Info "This may indicate the port changed or there's a connectivity issue."
+            }
           }
         }
       }
@@ -1149,9 +1444,12 @@ if (-not $useMdns -and -not $deviceAlreadyConnected) {
   if (Test-RestartRequested) { Restart-Script }
   
   Write-Warning "mDNS discovery didn't look usable."
+  # Additional diagnostics may have been shown above
   Write-Host ""
   
   # Try remembered pairings first
+  # Detect subnet first so we can use it for default IP if remembered pairings fail
+  $detectedSubnet = Get-CurrentSubnet
   if (Connect-RememberedPairings) {
     if (Test-RestartRequested) { Restart-Script }
     Write-Success "Successfully connected using remembered pairing."
@@ -1159,7 +1457,21 @@ if (-not $useMdns -and -not $deviceAlreadyConnected) {
   else {
     if (Test-RestartRequested) { Restart-Script }
     Write-Warning "No remembered pairings worked. Falling back to manual mode."
-    $defaultIp = Get-DefaultIpFromConfig
+    # Use IP from the detected subnet's pairing if available, otherwise fall back to config default
+    $defaultIp = $null
+    if ($detectedSubnet) {
+      $cfg = Import-Config
+      if ($cfg.pairings -and $cfg.pairings[$detectedSubnet]) {
+        $subnetPairing = $cfg.pairings[$detectedSubnet]
+        $ip = Get-PairingProperty $subnetPairing "ip"
+        if ($ip) {
+          $defaultIp = $ip
+        }
+      }
+    }
+    if (-not $defaultIp) {
+      $defaultIp = Get-DefaultIpFromConfig
+    }
     $ok = ConnectOrPairManual $defaultIp
     if (-not $ok) {
       if (Test-RestartRequested) { Restart-Script }
